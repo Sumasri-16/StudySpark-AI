@@ -3,3 +3,10 @@ streamlit
 google-genai
 pypdf
 python-dotenv
+<<<<<<< Updated upstream
+=======
+pillow
+pytesseract
+pymupdf
+python-docx
+>>>>>>> Stashed changes

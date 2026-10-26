@@ -4,13 +4,29 @@ import json
 import time
 import re
 import html
+import io
 
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
 from pypdf import PdfReader
+from PIL import Image, ImageOps
+import pytesseract
+from docx import Document
+
+try:
+    import pymupdf as fitz  # PyMuPDF, used to render scanned PDF pages for OCR
+except ImportError:
+    fitz = None
 
 load_dotenv()
+
+# Windows Tesseract executable path. On Streamlit Cloud, Tesseract is
+# installed through packages.txt and this Windows path is not used.
+if os.name == "nt":
+    _tesseract_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    if os.path.exists(_tesseract_path):
+        pytesseract.pytesseract.tesseract_cmd = _tesseract_path
 
 # =========================================================
 # PAGE CONFIGURATION
@@ -409,13 +425,57 @@ def call_ai_json(prompt):
 # =========================================================
 # SOURCE HELPERS
 # =========================================================
+def extract_image_text(uploaded_file):
+    """Extract printed text from an uploaded image using Tesseract OCR."""
+    image = Image.open(uploaded_file)
+    image = ImageOps.exif_transpose(image).convert("L")
+    return pytesseract.image_to_string(image, lang="eng", config="--psm 3").strip()
+
+
+def extract_word(uploaded_file):
+    """Extract paragraphs and table contents from a .docx file."""
+    document = Document(uploaded_file)
+    parts = []
+    for paragraph in document.paragraphs:
+        value = paragraph.text.strip()
+        if value:
+            parts.append(value)
+    for table_number, table in enumerate(document.tables, start=1):
+        parts.append(f"Table {table_number}:")
+        for row in table.rows:
+            parts.append(" | ".join(cell.text.strip().replace("\n", " ") for cell in row.cells))
+    return "\n\n".join(parts).strip()
+
+
 def extract_pdf(uploaded_file):
-    reader = PdfReader(uploaded_file)
+    """Extract selectable PDF text; OCR pages that are scanned/image-only."""
+    uploaded_file.seek(0)
+    pdf_bytes = uploaded_file.read()
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    rendered_document = None
+    if fitz is not None:
+        rendered_document = fitz.open(stream=pdf_bytes, filetype="pdf")
+
     pages = []
-    for number, page in enumerate(reader.pages, start=1):
-        text = (page.extract_text() or "").strip()
-        if text:
-            pages.append({"page": number, "text": text})
+    try:
+        for number, page in enumerate(reader.pages, start=1):
+            text = (page.extract_text() or "").strip()
+            if len(text) < 10 and rendered_document is not None:
+                try:
+                    rendered_page = rendered_document.load_page(number - 1)
+                    pix = rendered_page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                    image = Image.open(io.BytesIO(pix.tobytes("png")))
+                    image = ImageOps.grayscale(image)
+                    text = pytesseract.image_to_string(
+                        image, lang="eng", config="--psm 3"
+                    ).strip()
+                except Exception as exc:
+                    st.warning(f"OCR could not read PDF page {number}: {exc}")
+            if text:
+                pages.append({"page": number, "text": text})
+    finally:
+        if rendered_document is not None:
+            rendered_document.close()
     return pages
 
 
@@ -554,16 +614,17 @@ if st.session_state.page == "Home":
         key="home_pasted_notes",
     )
 
-    pdf = st.file_uploader(
-        "Or upload a text-based PDF",
-        type=["pdf"],
+    uploaded_document = st.file_uploader(
+        "Or upload a PDF, Word document, or image",
+        type=["pdf", "docx", "jpg", "jpeg", "png"],
         key="home_pdf",
-        help="Choose a PDF from your computer. Selectable text works best.",
+        help="Supports text PDFs, scanned PDFs (OCR), .docx, JPG, JPEG, and PNG.",
     )
 
-    if pdf is not None:
+    if uploaded_document is not None:
         st.info(
-            f"Selected file: {pdf.name} · {pdf.size / 1024:.1f} KB"
+            f"Selected file: {uploaded_document.name} · "
+            f"{uploaded_document.size / 1024:.1f} KB"
         )
 
     if st.button(
@@ -575,35 +636,38 @@ if st.session_state.page == "Home":
         pages = []
         filename = "Pasted notes"
 
-        if pdf is not None:
+        if uploaded_document is not None:
             try:
-                with st.spinner("Reading your PDF..."):
-                    pages = extract_pdf(pdf)
+                extension = uploaded_document.name.lower().rsplit(".", 1)[-1]
+                with st.spinner("Extracting text from your document..."):
+                    if extension == "pdf":
+                        pages = extract_pdf(uploaded_document)
+                        extracted_text = "\n\n".join(
+                            f"[Page {item['page']}]\n{item['text']}"
+                            for item in pages
+                        )
+                    elif extension == "docx":
+                        extracted_text = extract_word(uploaded_document)
+                    elif extension in ("jpg", "jpeg", "png"):
+                        extracted_text = extract_image_text(uploaded_document)
+                    else:
+                        raise ValueError("Unsupported file format.")
 
-                pdf_text = "\n\n".join(
-                    f"[Page {item['page']}]\n{item['text']}"
-                    for item in pages
-                )
-
-                if content and pdf_text:
-                    content = (
-                        content + "\n\n--- PDF CONTENT ---\n\n" + pdf_text
-                    )
-                    filename = f"Notes and {pdf.name}"
-                elif pdf_text:
-                    content = pdf_text
-                    filename = pdf.name
+                if extracted_text.strip():
+                    if content:
+                        content += "\n\n--- UPLOADED DOCUMENT ---\n\n" + extracted_text
+                        filename = f"Notes and {uploaded_document.name}"
+                    else:
+                        content = extracted_text
+                        filename = uploaded_document.name
                 elif not content:
                     st.error(
-                        "No selectable text was found in this PDF. "
-                        "It may be scanned or image-only. Please paste "
-                        "the text or use an OCR tool first."
+                        "No readable text was found. Try a clearer image/document "
+                        "or paste your notes manually."
                     )
-
             except Exception as exc:
-                st.error(f"Could not read this PDF: {exc}")
+                st.error(f"Could not read {uploaded_document.name}: {exc}")
                 content = ""
-
         if content.strip():
             save_source(content, filename, pages)
 
